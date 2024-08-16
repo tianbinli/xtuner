@@ -74,7 +74,7 @@ def llava_to_openai(data):
             img_content = []
 
             for chunk in chunks:
-                if chunk == image_token:
+                if chunk == image_token and not isinstance(url, None):
                     url = image_urls[image_id]
                     if not isinstance(url, str):
                         raise TypeError(data)
@@ -82,6 +82,9 @@ def llava_to_openai(data):
                     item = dict(type='image_url', image_url=url)
                     img_content.append(item)
                     image_id += 1
+                elif chunk == image_token and  isinstance(url, None):
+                    item = dict(type='text', text=chunk.strip().replace(image_token, ""))
+                    text_content.append(item)
                 elif len(chunk.strip()):
                     item = dict(type='text', text=chunk.strip())
                     text_content.append(item)

@@ -11,6 +11,40 @@ from xtuner._lite.chat import ChatMessages
 from xtuner.utils import DEFAULT_PAD_TOKEN_INDEX, IGNORE_INDEX
 from .format import OPENAI_FORMAT_MAP
 from .text import SoftPackerForText, TextTokenizedDataset
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = 5000000000
+from io import BytesIO
+from petrel_client.client import Client
+from PIL import ImageFile
+from xtuner._lite import get_logger
+logger = get_logger()
+
+ImageFile.LOAD_TRUNCATED_IMAGES=True 
+client = Client("~/petreloss.conf")
+from timeout_decorator import timeout
+
+@timeout(40)
+def read_img_general(img_path):
+    img_path = img_path.replace("langchao:s3://multi_modal/playground/data/", "s3://medical_preprocessed/image-text/general_data/")
+    if "s3://" in img_path:
+        img_bytes = client.get(img_path)
+        if img_bytes is None:
+            return None
+        image = Image.open(BytesIO(img_bytes)).convert('RGB')
+        image_size = image.size
+        max_size = (50000, 50000)
+        # 判断图片是否特别大
+        if image_size[0] > max_size[0] or image_size[1] > max_size[1]:
+            # 图片尺寸超过了阈值，进行调整
+            target_size = (2048, 2048)  # 修改为你想要的大小
+            image = image.resize(target_size)
+        return image
+    else:
+        image_file = os.path.join(img_path)
+        # if "/mnt/hwfile/chenzhe1/workspace_ltb/xtuner/" in str(image_file):
+        #     image_file = image_file.replace("/mnt/hwfile/chenzhe1/workspace_ltb/xtuner/", "/mnt/petrelfs/share_data/wangweiyun/share_data_eval/chemistry_data/")
+        return Image.open(image_file).convert('RGB')
+
 
 
 class LlavaTokenizeFunction():
@@ -51,6 +85,7 @@ class LlavaTokenizeFunction():
             tokenized['num_tokens'] += sum(num_img_tokens) - num_images
             tokenized['num_img_tokens'] = sum(num_img_tokens)
             tokenized['image_urls'] = image_urls
+            assert tokenized['num_img_tokens'] is not None, logger.debug(image_urls)
 
         return tokenized
 
@@ -64,7 +99,8 @@ class LlavaTokenizedDataset(TextTokenizedDataset):
     def process_tokenized_data(self, tokenized_data):
         images = []
         for url in tokenized_data['image_urls']:
-            img = Image.open(BytesIO(fileio.get(url)))
+            img = read_img_general(url)
+            # img = Image.open(BytesIO(fileio.get(url)))
             images.append(img)
 
         if len(images):
@@ -105,9 +141,17 @@ class LlavaTokenizedDataset(TextTokenizedDataset):
 
         if self.cached:
             self._free()
-
-        return self.process_tokenized_data(tokenized_data)
-
+        while True:
+            try:
+                result = self.process_tokenized_data(tokenized_data)
+                return result 
+            except Exception as e:
+                logger.debug(f"Error {e} is happened.")
+                logger.debug(f"{tokenized_data['image_urls']} error!")
+                import random
+                rand_idx = random.randint(0, item)
+                return self.__getitem__(rand_idx)
+            
 
 class LlavaRawDataset(torch.utils.data.Dataset):
 
@@ -122,7 +166,7 @@ class LlavaRawDataset(torch.utils.data.Dataset):
     def process_tokenized_data(self, tokenized_data):
         images = []
         for url in tokenized_data['image_urls']:
-            img = Image.open(url)
+            img = read_img_general(url)
             images.append(img)
 
         if len(images):
@@ -145,7 +189,16 @@ class LlavaRawDataset(torch.utils.data.Dataset):
 
         raw_data = self.dataset[item]
         tokenized_data = self.tokenize_fn(raw_data)
-        return self.process_tokenized_data(tokenized_data)
+        
+        while True:
+            try:
+                return self.process_tokenized_data(tokenized_data)
+            except Exception as e:
+                logger.debug(f"Error {e} is happened.")
+                logger.debug(f"{tokenized_data['image_urls']} error!")
+                import random
+                rand_idx = random.randint(0, self.max_length)
+                return self.__getitem__(rand_idx)
 
 
 class SoftPackerForLlava(SoftPackerForText):
@@ -167,64 +220,73 @@ class SoftPackerForLlava(SoftPackerForText):
         Returns:
             A dict including packed input_ids, labels, and cumulative_len.
         """
-        if self.cached:
-            self.load_cache()
+        while True:
+            try:
+                if self.cached:
+                    self.load_cache()
 
-        dataset = self.dataset
-        pack_info = self.pack_info
+                dataset = self.dataset
+                pack_info = self.pack_info
 
-        packed_items = pack_info[item]['indices']
-        assert len(packed_items) > 0
+                packed_items = pack_info[item]['indices']
+                assert len(packed_items) > 0
 
-        packed_input_ids = []
-        packed_labels = []
-        packed_img_urls = []
-        packed_num_tokens = []
-        packed_num_img_tokens = []
-        for i in packed_items:
-            packed_input_ids.extend(dataset[i]['input_ids'])
-            packed_labels.extend(dataset[i]['labels'])
+                packed_input_ids = []
+                packed_labels = []
+                packed_img_urls = []
+                packed_num_tokens = []
+                packed_num_img_tokens = []
+                for i in packed_items:
+                    packed_input_ids.extend(dataset[i]['input_ids'])
+                    packed_labels.extend(dataset[i]['labels'])
 
-            _num_tokens = dataset[i]['num_tokens']
-            packed_num_tokens.append(_num_tokens)
+                    _num_tokens = dataset[i]['num_tokens']
+                    packed_num_tokens.append(_num_tokens)
 
-            if 'image_urls' in dataset[item]:
-                packed_img_urls.extend(dataset[item]['image_urls'])
+                    if 'image_urls' in dataset[item]:
+                        packed_img_urls.extend(dataset[item]['image_urls'])
 
-            if 'num_img_tokens' in dataset[i]:
-                _num_img_tokens = dataset[i]['num_img_tokens']
-                packed_num_img_tokens.append(_num_img_tokens)
+                    if 'num_img_tokens' in dataset[i]:
+                        _num_img_tokens = dataset[i]['num_img_tokens']
+                        assert  _num_img_tokens is not None, print(packed_img_urls, 1)
+                        packed_num_img_tokens.append(_num_img_tokens)
 
-        images = []
-        for url in packed_img_urls:
-            img = Image.open(BytesIO(fileio.get(url)))
-            images.append(img)
+                images = []
+                for url in packed_img_urls:
+                    img = read_img_general(url)
+                    # img = Image.open(BytesIO(fileio.get(url)))
+                    images.append(img)
 
-        if len(images):
-            outputs = self.image_processor(images, return_tensors='pt')
-            pixel_values = outputs['pixel_values']
-        else:
-            pixel_values = None
+                if len(images):
+                    outputs = self.image_processor(images, return_tensors='pt')
+                    pixel_values = outputs['pixel_values']
+                else:
+                    pixel_values = None
 
-        if sum(packed_num_tokens) < self.max_length:
-            num_pad_tokens = self.max_length - sum(packed_num_tokens)
-            packed_input_ids.extend([DEFAULT_PAD_TOKEN_INDEX] * num_pad_tokens)
-            packed_labels.extend([IGNORE_INDEX] * num_pad_tokens)
-            packed_num_tokens.append(num_pad_tokens)
-        else:
-            packed_num_tokens.append(0)
+                if sum(packed_num_tokens) < self.max_length:
+                    num_pad_tokens = self.max_length - sum(packed_num_tokens)
+                    packed_input_ids.extend([DEFAULT_PAD_TOKEN_INDEX] * num_pad_tokens)
+                    packed_labels.extend([IGNORE_INDEX] * num_pad_tokens)
+                    packed_num_tokens.append(num_pad_tokens)
+                else:
+                    packed_num_tokens.append(0)
 
-        packed = {
-            'input_ids': packed_input_ids,
-            'labels': packed_labels,
-            'pixel_values': pixel_values,
-            'num_tokens': packed_num_tokens,
-            'num_img_tokens': packed_num_img_tokens
-        }
+                packed = {
+                    'input_ids': packed_input_ids,
+                    'labels': packed_labels,
+                    'pixel_values': pixel_values,
+                    'num_tokens': packed_num_tokens,
+                    'num_img_tokens': packed_num_img_tokens
+                }
 
-        if self.cached:
-            self._free()
-        return packed
+                if self.cached:
+                    self._free()
+                return packed
+            except Exception as e:
+                logger.debug(f"Error {e} is happened.")
+                import random
+                rand_idx = random.randint(0, item)
+                return self.__getitem__(rand_idx)
 
     @classmethod
     def from_cache(cls, cache_dir, image_processor, max_length):
