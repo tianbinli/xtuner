@@ -100,6 +100,7 @@ class LlavaTokenizedDataset(TextTokenizedDataset):
         images = []
         for url in tokenized_data['image_urls']:
             img = read_img_general(url)
+            assert img is not None, f"read image: {url} is None"
             # img = Image.open(BytesIO(fileio.get(url)))
             images.append(img)
 
@@ -167,6 +168,7 @@ class LlavaRawDataset(torch.utils.data.Dataset):
         images = []
         for url in tokenized_data['image_urls']:
             img = read_img_general(url)
+            assert img is not None, f"read image: {url} is None"
             images.append(img)
 
         if len(images):
@@ -254,6 +256,7 @@ class SoftPackerForLlava(SoftPackerForText):
                 images = []
                 for url in packed_img_urls:
                     img = read_img_general(url)
+                    assert img is not None, f"read image: {url} is None"
                     # img = Image.open(BytesIO(fileio.get(url)))
                     images.append(img)
 
