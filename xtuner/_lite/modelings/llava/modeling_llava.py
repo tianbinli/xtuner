@@ -334,22 +334,34 @@ class LlavaForConditionalGeneration(LlavaPreTrainedModel):
         )
         image_to_overwrite[batch_indices, text_to_overwrite] = False
         image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None].to(target_device)
+        try:
+            if image_to_overwrite.sum() != image_features.shape[:-1].numel():
+                print(
+                    f"The input provided to the model are wrong. The number of image tokens is {torch.sum(special_image_token_mask)} while"
+                    f" the number of image given to the model is {num_images}. This prevents correct indexing and breaks batch generation."
+                )
+                if image_to_overwrite.sum() < image_features.shape[:-1].numel():
+                    image_features = image_features[:-(num_images - torch.sum(special_image_token_mask))]
+                else:               
+                    # 复制最后一个元素
+                    last_element = image_features[-1:] 
+                    concat_features = [image_features]
+                    for i in range(torch.sum(special_image_token_mask) - num_images):
+                        concat_features.append(last_element)
+                    image_features = torch.cat(concat_features, dim=0)
+                    
 
-        if image_to_overwrite.sum() != image_features.shape[:-1].numel():
-            raise ValueError(
-                f"The input provided to the model are wrong. The number of image tokens is {torch.sum(special_image_token_mask)} while"
-                f" the number of image given to the model is {num_images}. This prevents correct indexing and breaks batch generation."
-            )
+            final_embedding[image_to_overwrite] = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+            final_attention_mask |= image_to_overwrite
+            position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
 
-        final_embedding[image_to_overwrite] = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
-        final_attention_mask |= image_to_overwrite
-        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
+            # 6. Mask out the embedding at padding positions, as we later use the past_key_value value to determine the non-attended tokens.
+            batch_indices, pad_indices = torch.where(input_ids == self.pad_token_id)
+            indices_to_mask = new_token_positions[batch_indices, pad_indices]
 
-        # 6. Mask out the embedding at padding positions, as we later use the past_key_value value to determine the non-attended tokens.
-        batch_indices, pad_indices = torch.where(input_ids == self.pad_token_id)
-        indices_to_mask = new_token_positions[batch_indices, pad_indices]
-
-        final_embedding[batch_indices, indices_to_mask] = 0
+            final_embedding[batch_indices, indices_to_mask] = 0
+        except Exception as e:
+            print(e)
 
         if labels is None:
             final_labels = None
