@@ -84,10 +84,11 @@ def multi_thread_map(map_fns, dataset, desc, num_proc=8):
 
     with ThreadPoolExecutor(max_workers=num_proc) as executor:
         results = list(
-            tqdm(
-                executor.map(sequential_map, dataset),
-                desc=desc,
-                total=len(dataset)))
+            result for result in tqdm(
+            executor.map(sequential_map, dataset),
+            desc=desc,
+            total=len(dataset)
+        ) if result is not None)
 
     return results
 

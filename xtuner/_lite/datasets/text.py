@@ -322,6 +322,44 @@ class SoftPackerForText(CacheDataset):
 
         return pack_infos
 
+
+    @classmethod
+    def get_pack_infos(cls, datasets, max_length):
+        import math
+        from tqdm import tqdm
+
+        if dist.is_available():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        else:
+            world_size = 1
+            rank = 0
+
+        num_dsets = len(datasets)
+        avg_num = math.ceil(num_dsets / world_size)
+
+        pack_infos = []
+        start = rank * avg_num
+        end = min((rank + 1) * avg_num, num_dsets)
+        desc = f'[Rank {rank}] Soft Packing'
+        for ind in tqdm(range(start, end), desc=desc):
+            pack_infos.append(cls.get_pack_info(datasets[ind], max_length))
+
+        if dist.is_available() and world_size > 1:
+            dist.barrier()
+            buffers = [None] * world_size
+            dist.all_gather_object(buffers, pack_infos)
+            world_pack_infos = []
+            for infos_per_rank in buffers:
+                world_pack_infos.extend(infos_per_rank)
+
+            assert len(world_pack_infos) == num_dsets
+        else:
+            world_pack_infos = pack_infos
+        return world_pack_infos
+
+
+
     @classmethod
     def from_cache(cls, cache_dir, max_length, seed=None):
 
