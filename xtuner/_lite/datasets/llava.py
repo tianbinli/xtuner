@@ -16,12 +16,27 @@ Image.MAX_IMAGE_PIXELS = 5000000000
 from io import BytesIO
 # from petrel_client.client import Client
 from PIL import ImageFile
+
 from xtuner._lite import get_logger
 logger = get_logger()
 
 ImageFile.LOAD_TRUNCATED_IMAGES=True 
 # client = Client("~/petreloss.conf")
 from timeout_decorator import timeout
+
+def expand2square(pil_img, background_color):
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = Image.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = Image.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
+
 
 @timeout(30)
 def read_img_general(img_path):
@@ -90,7 +105,8 @@ class LlavaTokenizeFunction():
                 tokenized['image_urls'] = image_urls
 
             return tokenized
-        except:
+        except Exception as e:
+            print(e)
             print(item)
             return None
 
@@ -250,12 +266,16 @@ class SoftPackerForLlava(SoftPackerForText):
                         packed_img_urls.extend(dataset[i]['image_urls'])
                     if 'num_img_tokens' in dataset[i]:
                         _num_img_tokens = dataset[i]['num_img_tokens']
-                        assert  _num_img_tokens is not None, print(packed_img_urls, 1)
+                        assert  _num_img_tokens is not None, logger.debug(packed_img_urls, 1)
                         packed_num_img_tokens.append(_num_img_tokens)
                 images = []
                 for url in packed_img_urls:
                     img = read_img_general(url)
                     assert img is not None, f"read image: {url} is None"
+                    img = expand2square(
+                        img,
+                        tuple(
+                            int(x* 255) for x in self.image_processor.image_mean))
                     # img = Image.open(BytesIO(fileio.get(url)))
                     images.append(img)
                 if len(images):

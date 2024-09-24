@@ -125,6 +125,8 @@ class EnhancedLlavaConfig(PretrainedConfig):
                 AutoConfig.register('internlm2', InternLM2Config)
                 AutoModelForCausalLM.register(
                     InternLM2Config, InternLM2ForCausalLM)
+                if 'auto_map' not in text_config:
+                    text_config['auto_map'] = {}
                 text_config['auto_map']['AutoConfig'] = 'configuration_internlm2.InternLM2Config'
                 text_config['auto_map']['AutoModel'] = 'modeling_internlm2.InternLM2ForCausalLM'
                 text_config['auto_map']['AutoModelForCausalLM'] = 'modeling_internlm2.InternLM2ForCausalLM'
