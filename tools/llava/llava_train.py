@@ -36,28 +36,27 @@ from torch.distributed.fsdp.wrap import _or_policy
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import ConcatDataset, DataLoader
-from xtuner._lite.modelings.llava.llava_model import LlavaForConditionalGeneration
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           CLIPVisionModel, LlavaConfig, CLIPImageProcessor,
-                          LlavaProcessor)
+                          LlavaForConditionalGeneration, LlavaProcessor)
 from transformers.utils.import_utils import (is_flash_attn_2_available,
                                              is_torch_sdpa_available)
 
 from xtuner._lite import AutoTokenizer, get_logger
-from xtuner._lite.accelerate import (LORA_TARGET_MAP, 
+from xtuner._lite.accelerate import (LORA_TARGET_MAP, LoadWoInit,
                                      dispatch_modules, packed_sequence)
-
-from xtuner._lite.parallel.fsdp import (RECOMPUTE_MODULES,LoadWoInit,
+from xtuner._lite.accelerate.fsdp import (RECOMPUTE_MODULES,
                                           all_required_grad_wrap_policy,
                                           checkpoint_check_fn, dp_lazy_init,
                                           layer_auto_wrap_policy)
 from xtuner._lite.chat import CHAT_TEMPLATE_MAP
-from xtuner._lite.datasets import (LlavaCollator, LlavaTokenizedDataset,
+from xtuner._lite.datasets import (LlavaCollator, LlavaRawDataset,
                                    LlavaTokenizeFunction, SoftPackerForLlava)
 from xtuner._lite.datasets.load import (LOAD_FN_MAP, load_datasets,
                                         load_from_cache)
 from xtuner._lite.modelings import register_remote_code
 from xtuner._lite.parallel import LengthGroupedSampler, ParallelSampler
+from llava_model import LlavaForConditionalGeneration
 from torch.distributed.checkpoint.stateful import Stateful
 from xtuner.utils import DEFAULT_PAD_TOKEN_INDEX
 
@@ -237,7 +236,7 @@ def parse_args():
     data_args.add_argument(
         '--max-keep-ckpts',
         type=int,
-        default=5, 
+        default=3,
         help='the maximum number of checkpoints to keep.')
     data_args.add_argument(
         '--num-workers',
@@ -264,14 +263,6 @@ def parse_args():
 
     optim_args.add_argument(
         '--lr', default=4e-5, type=float, help='learning rate.')
-    model_args.add_argument(
-        '--diff-lr',
-        action='store_true',
-        help='Apply diffrent lr to Model.')
-    optim_args.add_argument(
-        '--vit-lr', default=1e-5, type=float, help='learning rate.')
-    optim_args.add_argument(
-        '--llm-lr', default=1e-6, type=float, help='learning rate.')
     optim_args.add_argument(
         '--wd', default=0.01, type=float, help='weight decay.')
     optim_args.add_argument(
@@ -375,9 +366,6 @@ def build_llava_model(args, config, world_size, dtype=torch.float32,
             llava.vision_tower.requires_grad_(False)
             if world_size > 1:
                 llava.vision_tower.to(dtype)
-        
-        # for name, param in llava.named_parameters():
-        #     print(f"Parameter: {name}, requires_grad: {param.requires_grad}")
 
         if args.llm_use_lora:
             llm = llava.language_model
@@ -493,7 +481,7 @@ def llava_sft(args):
               ' the `group_by_modality_length` will be used.')
 
     device_mesh = init_device_mesh(
-        'cuda', (dp_size,), mesh_dim_names=('dp',))
+        'cuda', (dp_size, ), mesh_dim_names=('dp', ))
 
     dp_mesh = device_mesh['dp']
 
@@ -571,8 +559,8 @@ def llava_sft(args):
         processor = LlavaProcessor(_img_processor, tokenizer)
     else:
         llava_config = AutoConfig.from_pretrained(args.llava)
-        # if hasattr(llava_config.text_config, 'auto_map'):
-        #     delattr(llava_config.text_config, 'auto_map')
+        if hasattr(llava_config.text_config, 'auto_map'):
+            delattr(llava_config.text_config, 'auto_map')
         processor = AutoProcessor.from_pretrained(
             args.llava, trust_remote_code=True)
 
@@ -591,17 +579,7 @@ def llava_sft(args):
     ###########################################################################
     start_load_data_t = time.time()
     if args.dset_from_cache:
-        if args.dset_pack_level == 'soft':
-            init_fn = partial(
-                SoftPackerForLlava.from_cache,
-                image_processor=img_processor,
-                max_length=args.max_length)
-        else:
-            init_fn = partial(
-                LlavaTokenizedDataset.from_cache,
-                image_processor=img_processor,
-                max_length=args.max_length)
-        _datasets = load_from_cache(args.dset_cache_dir, init_fn)
+        _datasets = load_from_cache(args.dset_cache_dir)
         dist.barrier()
     else:
         dset_infos = load(args.datasets)
@@ -628,20 +606,15 @@ def llava_sft(args):
             # and `num_tokens`.
             tokenize_fn = LlavaTokenizeFunction(tokenizer, chat_template,
                                                 per_img_tokens, image_dir,
-                                                dset_format)
+                                                dset_format, max_length=args.max_length)
 
-            if args.dset_pack_level == 'soft':
-                init_fn = partial(
-                    SoftPackerForLlava,
-                    image_processor=img_processor,
-                    max_length=args.max_length)
+            if args.dset_pack_level:
+                init_fn = Dataset.from_list
             else:
                 init_fn = partial(
-                    LlavaTokenizedDataset,
+                    LlavaRawDataset,
                     image_processor=img_processor,
-                    max_length=args.max_length,
-                    # tokenize_fn=tokenize_fn
-                    )
+                    tokenize_fn=tokenize_fn)
                 # Online tokenization is used when not using a pack dataset,
                 # saving startup time.
                 tokenize_fn = None
@@ -663,27 +636,25 @@ def llava_sft(args):
 
     if args.dset_pack_level and rank == 0:
         # Only the tokenized datasets can count the number of tokens
-        total_tokens = sum(dset.total_tokens for dset in _datasets)
-        logger.debug(f'[Dataset] {total_tokens} tokens.')
+        num_tokens = sum(sum(dset['num_tokens']) for dset in _datasets)
+        logger.debug(f'[Dataset] {num_tokens} tokens.')
 
-    
+    num_datasets = len(_datasets)
+    datasets = []
+    if args.dset_pack_level and args.dset_pack_level == 'soft':
+        pack_infos = SoftPackerForLlava.get_pack_infos(_datasets,
+                                                       args.pack_max_length)
+        for i in range(num_datasets):
+            _infos = pack_infos[i]
+            _dset = _datasets[i]
+            _packed_dset = SoftPackerForLlava(_dset, img_processor,
+                                              args.pack_max_length, _infos)
+            datasets.append(_packed_dset)
+    else:
+        for i, dset in enumerate(_datasets):
+            datasets.append(dset)
 
-    # num_datasets = len(_datasets)
-    # datasets = []
-    # if args.dset_pack_level and args.dset_pack_level == 'soft':
-    #     pack_infos = SoftPackerForLlava.get_pack_infos(_datasets,
-    #                                                    args.pack_max_length)
-    #     for i in range(num_datasets):
-    #         _infos = pack_infos[i]
-    #         _dset = _datasets[i]
-    #         _packed_dset = SoftPackerForLlava(_dset, img_processor,
-    #                                           args.pack_max_length, _infos)
-    #         datasets.append(_packed_dset)
-    # else:
-    #     for i, dset in enumerate(_datasets):
-    #         datasets.append(dset)
-    train_dataset = ConcatDataset(_datasets)
-
+    train_dataset = ConcatDataset(datasets)
 
     if args.dset_pack_level and rank == 0:
         ori_samples = sum([len(dset) for dset in _datasets])
@@ -702,8 +673,7 @@ def llava_sft(args):
         sampler = LengthGroupedSampler(train_dataset, dp_mesh,
                                        args.global_batch_size,
                                        seed=args.seed,
-                                    #    length_property=length_property
-                                       )
+                                       length_property=length_property)
     elif args.group_by_modality_length:
         # 当开启 soft packing 时，暂时不支持模态区分
         if args.dset_pack_level:
@@ -856,31 +826,11 @@ def llava_sft(args):
     ###########################################################################
     #                      4. Optimizer & Scheduler                           #
     ###########################################################################
-    if args.diff_lr:
-        # 创建参数组
-        llm_params = []
-        vit_params = []
-        projector_params = []
-        for name, param in shard_llava.named_parameters():
-            if param.requires_grad:
-                if "language_model" in name:
-                    llm_params.append(param)
-                elif "vision_model" in name:
-                    vit_params.append(param)
-                elif "projector" in name:
-                    projector_params.append(param)
-        optimizer = AdamW(
-            [
-                {"params": llm_params, "lr": args.llm_lr},
-                {"params": vit_params, "lr": args.vit_lr},
-                {"params": projector_params, "lr": args.lr},
-            ], weight_decay=args.wd, fused=True)
-    else:
-        requried_grad_params = [
-            param for param in shard_llava.parameters() if param.requires_grad
-        ]
-        optimizer = AdamW(
-            requried_grad_params, lr=args.lr, weight_decay=args.wd, fused=True)
+    requried_grad_params = [
+        param for param in shard_llava.parameters() if param.requires_grad
+    ]
+    optimizer = AdamW(
+        requried_grad_params, lr=args.lr, weight_decay=args.wd, fused=True)
 
     global_batch_size = args.global_batch_size
     mirco_batch_size = args.mirco_batch_size
@@ -948,13 +898,9 @@ def llava_sft(args):
 
         start_step = meta_stateful['step']
         logger.info(f'[Resume] start_step to {start_step}')
-        if start_step >= warmup_steps:
-            cosine_scheduler.step(start_step - warmup_steps)
+        cosine_scheduler.step(start_step)
         logger.info(f'[Resume] cosine_scheduler to {cosine_scheduler.get_lr()[0]}')
-        if start_step >= warmup_steps:
-            warmup_scheduler.step(warmup_steps)
-        else:
-            warmup_scheduler.step(start_step)
+        warmup_scheduler.step(start_step)
         logger.info(f'[Resume] start_step to {warmup_scheduler.get_lr()[0]}')
 
     ###########################################################################
@@ -974,133 +920,107 @@ def llava_sft(args):
         # 全部都保存
         max_keep_ckpts = 100000000
 
+    shard_llava.train()
     for step in range(start_step, total_steps):
-        oom_flag = False
-        try:
 
-            epoch = step // per_epoch_steps
-            epoch_inner_step = step % per_epoch_steps
-            if epoch_inner_step == 0 or step == start_step:
-                # For the first step of each epoch, the data order needs to be
-                # readjusted.
-                # Or after resuming, for the first step, the dataloader needs to
-                # be adjusted to the position before resume.
-                # train_dataloader.sampler.set_epoch(epoch, inner_step)
-                train_dataloader.sampler.set_epoch(epoch, epoch_inner_step)
-                data_iterator = iter(train_dataloader)
+        epoch = step // per_epoch_steps
+        epoch_inner_step = step % per_epoch_steps
+        if epoch_inner_step == 0 or step == start_step:
+            # For the first step of each epoch, the data order needs to be
+            # readjusted.
+            # Or after resuming, for the first step, the dataloader needs to
+            # be adjusted to the position before resume.
+            # train_dataloader.sampler.set_epoch(epoch, inner_step)
+            train_dataloader.sampler.set_epoch(epoch, epoch_inner_step)
+            data_iterator = iter(train_dataloader)
 
-            if step <= warmup_steps:
-                warmup_scheduler.step()
-                cur_lr = warmup_scheduler.get_lr()[0]
-            else:
-                cosine_scheduler.step()
-                cur_lr = cosine_scheduler.get_lr()[0]
+        if step <= warmup_steps:
+            warmup_scheduler.step()
+            cur_lr = warmup_scheduler.get_lr()[0]
+        else:
+            cosine_scheduler.step()
+            cur_lr = cosine_scheduler.get_lr()[0]
 
-            torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats()
 
-            step_loss = 0
-            step_data_time = 0
-            step_start_t = time.time()
-            step_consumed_tokens = 0
-            step_consumed_img_tokens = 0
-            for _ in range(per_step_iters):
+        step_loss = 0
+        step_data_time = 0
+        step_start_t = time.time()
+        step_consumed_tokens = 0
+        step_consumed_img_tokens = 0
+        for _ in range(per_step_iters):
 
-                _data_start_t = time.time()
-                data = next(data_iterator)
-                step_data_time += time.time() - _data_start_t
+            _data_start_t = time.time()
+            data = next(data_iterator)
+            step_data_time += time.time() - _data_start_t
 
-                input_ids = data['input_ids'].cuda(non_blocking=True)
-                pixel_values = data['pixel_values']
-                if isinstance(pixel_values, torch.Tensor):
-                    pixel_values = pixel_values.cuda(non_blocking=True)
-                labels = data['labels'].cuda(non_blocking=True)
-                attention_mask = data['attention_mask'].cuda(non_blocking=True)
-                num_tokens = data['num_tokens'].cuda(non_blocking=True)
-                num_img_tokens = data['num_img_tokens'].cuda(non_blocking=True)
+            input_ids = data['input_ids'].cuda(non_blocking=True)
+            pixel_values = data['pixel_values']
+            if isinstance(pixel_values, torch.Tensor):
+                pixel_values = pixel_values.cuda(non_blocking=True)
+            labels = data['labels'].cuda(non_blocking=True)
+            attention_mask = data['attention_mask'].cuda(non_blocking=True)
+            num_tokens = data['num_tokens'].cuda(non_blocking=True)
+            num_img_tokens = data['num_img_tokens'].cuda(non_blocking=True)
 
-                packed_ctx = packed_sequence(num_tokens, enable=pack_batch)
+            packed_ctx = packed_sequence(num_tokens, enable=pack_batch)
 
-                with packed_ctx:
-                    with autocast if use_lora else nullcontext():
-                        outputs = shard_llava(
-                            input_ids=input_ids,
-                            labels=labels,
-                            pixel_values=pixel_values,
-                            attention_mask=attention_mask)
-                        avg_iter_loss = outputs.loss / per_step_iters
+            with packed_ctx:
+                with autocast if use_lora else nullcontext():
+                    outputs = shard_llava(
+                        input_ids=input_ids,
+                        labels=labels,
+                        pixel_values=pixel_values,
+                        attention_mask=attention_mask)
+                    avg_iter_loss = outputs.loss / per_step_iters
 
-                    if scaler and use_lora:
-                        scaler.scale(avg_iter_loss).backward()
-                    else:
-                        avg_iter_loss.backward()
-                        # try:
-                        #     avg_iter_loss.backward()
-                        # except RuntimeError as e:
-                        #     logger.info(f"Error during backward pass: {e}, avg_iter_loss does not require grad. Check the computation graph.")
-                        #     # 根据具体情况进行进一步的处理，比如重新检查损失计算逻辑，或跳过此步
-                        
-
-                step_loss += avg_iter_loss.item()
-                step_consumed_img_tokens += num_img_tokens.sum()
-                if args.dset_pack_level == 'soft':
-                    # During a soft pack process, the data with a length that is
-                    # still smaller than the max length after packing, will be
-                    # padded to the max length. The last element of num tokens
-                    # represents the count of pad tokens.
-                    step_consumed_tokens += num_tokens[:-1].sum()
+                if scaler and use_lora:
+                    scaler.scale(avg_iter_loss).backward()
                 else:
-                    step_consumed_tokens += num_tokens.sum()
-            
-            # try:
-            #     grad_norm = shard_llava.clip_grad_norm_(args.max_grad_norm)
-            # except RuntimeError as e:
-            #     logger.error(f"Error in clipping gradients: {e}")
-            #     grad_norm = float('0.')  # 或者设定一个默认值
-            grad_norm = shard_llava.clip_grad_norm_(args.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
+                    avg_iter_loss.backward()
 
-            step_text_tokens = step_consumed_tokens - step_consumed_img_tokens
-            step_img_tokens = step_consumed_img_tokens
-            step_time = time.time() - step_start_t
-            eta = step_time * (total_steps - step)
-            eta = timedelta(seconds=int(eta))
-            tgs = int(step_consumed_tokens / step_time)
-            max_memory = torch.cuda.max_memory_allocated()
-            if is_interval(step, total_steps, args.log_interval):
-                logger.info(
-                    f'[Train] (Epoch {epoch}) Step {step + 1}/{total_steps}  '  # noqa: E501
-                    f'lr: {cur_lr:.8f}  loss: {step_loss:.3f}  '
-                    f'grad_norm: {grad_norm:.2f}  '
-                    f'max_memory: {(max_memory / 1024 ** 3):.1f}GB  '
-                    f'text_tokens: {step_text_tokens}  '
-                    f'image_tokens: {step_img_tokens}  '
-                    f'tgs: {tgs}  data_time: {step_data_time:.2f}s  '
-                    f'time: {step_time:.2f}s  '
-                    f'eta: {eta}')
-        except Exception as e:
-            if "out of memory" in str(e):
-                logger.info("OOM error occurred, clearing cache...")
-                torch.cuda.empty_cache()  # 清空显存
-                oom_flag = True
-            else:
-                raise e  # 如果是其他异常，重新抛出
+            step_loss += avg_iter_loss.item()
+            step_consumed_tokens += num_tokens.sum()
+            step_consumed_img_tokens += num_img_tokens.sum()
 
+        grad_norm = shard_llava.clip_grad_norm_(args.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
 
-        if is_interval(step, total_steps, checkpoint_interval) or oom_flag :
-            if oom_flag:
-                step -= 1
+        step_text_tokens = step_consumed_tokens - step_consumed_img_tokens
+        step_img_tokens = step_consumed_img_tokens
+        step_time = time.time() - step_start_t
+        eta = step_time * (total_steps - step)
+        eta = timedelta(seconds=int(eta))
+        tgs = int(step_consumed_tokens / step_time)
+        max_memory = torch.cuda.max_memory_allocated()
+        if is_interval(step, total_steps, args.log_interval):
+            logger.info(
+                f'[Train] (Epoch {epoch}) Step {step + 1}/{total_steps}  '  # noqa: E501
+                f'lr: {cur_lr:.6f}  loss: {step_loss:.3f}  '
+                f'grad_norm: {grad_norm:.2f}  '
+                f'max_memory: {(max_memory / 1024 ** 3):.1f}GB  '
+                f'text_tokens: {step_text_tokens}  '
+                f'image_tokens: {step_img_tokens}  '
+                f'tgs: {tgs}  data_time: {step_data_time:.2f}s  '
+                f'time: {step_time:.2f}s  '
+                f'eta: {eta}')
+
+        if is_interval(step, total_steps, checkpoint_interval):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             max_memory = torch.cuda.max_memory_allocated()
             logger.info('[Checkpoint] Before saving checkpoint, the peak GPU '
                         f'memory is {max_memory / 1024 ** 3:.1f}GB.')
+
             digits = len(str(abs(total_steps)))
             work_dir = args.work_dir
+
             ckpt_id = f'{(step + 1):0{digits}}-of-{total_steps:0{digits}}'
             ckpt_dir = os.path.join(work_dir, f'ckpt-{ckpt_id}')
             hf_dir = os.path.join(work_dir, f'hf-{ckpt_id}')
             _options = StateDictOptions(cpu_offload=True, full_state_dict=True)
+
             full_model_state_dict = get_model_state_dict(
                 shard_llava, options=_options)
             if rank == 0:
@@ -1109,38 +1029,43 @@ def llava_sft(args):
                 for name, param in full_model_state_dict.items():
                     set_module_tensor_to_device(saved_llava, name, 'cpu',
                                                 param)
+
                 if args.llm_use_lora:
                     merged_llm = saved_llava.language_model.merge_and_unload()
                     saved_llava.language_model = merged_llm
+
                 if args.vit_use_lora:
                     merged_vit = saved_llava.vision_tower.merge_and_unload()
                     saved_llava.vision_tower = merged_vit
+
                 saved_llava.save_pretrained(hf_dir)
                 tokenizer.save_pretrained(hf_dir)
                 processor.save_pretrained(hf_dir)
                 del saved_llava
+
             dist.barrier()
             del full_model_state_dict
+
             if rank == 0:
                 save_hf_ckpt_names.append(hf_dir)
                 if len(save_hf_ckpt_names) > max_keep_ckpts:
                     # 移除最先加入的
                     remove_hf_ckpt_name = save_hf_ckpt_names.pop(0)
-                    logger.warning(f"remove checkpoint {remove_hf_ckpt_name}")
                     os.system(f'rm -rf {remove_hf_ckpt_name}')
+
             if args.checkpoint_drop_optimizer:
                 logger.warning('[Checkpoint] The saved checkpoint cannot be '
-                            'resumed. If you want to save a resumable '
-                            'checkpoint, please remove '
-                            '`--checkpoint-drop-optimizer` '
-                            'from the command.')
+                               'resumed. If you want to save a resumable '
+                               'checkpoint, please remove '
+                               '`--checkpoint-drop-optimizer` '
+                               'from the command.')
             else:
                 # FSDP cannot be saved via torch.save
                 # Refer to https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html  # noqa: E501
                 _options = StateDictOptions(
                     cpu_offload=True, ignore_frozen_params=True)
                 (shard_model_state_dict,
-                shard_optimizer_state_dict) = get_state_dict(
+                 shard_optimizer_state_dict) = get_state_dict(
                     shard_llava, optimizer, options=_options)
                 meta_stateful = MetaStateful(step=step + 1, total_steps=total_steps)
                 # warmup_scheduler/cosine_scheduler 并不是 Stateful 对象，但是是 work 的，
@@ -1150,23 +1075,23 @@ def llava_sft(args):
                     'model': shard_model_state_dict,
                     'optimizer': shard_optimizer_state_dict,
                     'meta_stateful': meta_stateful,
-                    'step': step,
-                    'total_steps': total_steps,
                     'warmup_scheduler': warmup_scheduler.state_dict(),
                     'cosine_scheduler': cosine_scheduler.state_dict()
                 }
                 dcp.save(state_dict, checkpoint_id=ckpt_dir)
+
                 if rank == 0:
                     # 只能存储到 work_dir/../last_checkpoint 这，否则不好找
                     save_file = os.path.join(args.work_dir, '../', 'last_checkpoint')
                     with open(save_file, 'w') as f:
                         f.write(ckpt_dir)  # type: ignore
+
                     save_pt_ckpt_names.append(ckpt_dir)
                     if len(save_pt_ckpt_names) > max_keep_ckpts:
                         # 移除最先加入的
                         remove_pt_ckpt_name = save_pt_ckpt_names.pop(0)
                         os.system(f'rm -rf {remove_pt_ckpt_name}')
-                del state_dict
+
                 max_memory = torch.cuda.max_memory_allocated()
                 logger.info(
                     '[Checkpoint] During saving checkpoint, the peak GPU '
